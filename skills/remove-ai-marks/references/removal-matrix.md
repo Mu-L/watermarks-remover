@@ -4,7 +4,7 @@
 | --- | --- | --- | --- | --- |
 | Invisible Unicode / exotic spaces / bidi / tags | Strip / normalize | `inspect_text.py`, `clean_text.py`, `clean_file.py` | Minimal | Yes (codepoint report) |
 | Stylometric AI cadence / burstiness / n-grams (zero-LLM) | Statistical variance & cadence scoring | `score_stylometry.py`, `inspect_text.py --stylometry`, `audit_dir.py --check-stylometry` | None (detection only) | Yes (calibrated score + phrase spans) |
-| Statistical text watermark (SynthID-class / Kirchenbauer) | Multi-pass paraphrase / humanize / back-translate / structural | Agent Layer B + optional `rewrite_text.py` | Meaning/style drift | No without vendor key/detector; **MarkLLM harness** (`detect_text_watermark.py`) verifies a specific scheme config before/after |
+| Statistical text watermark (SynthID-class / Kirchenbauer) | Multi-pass paraphrase / humanize / back-translate / structural; or `--minimal-select` (+ optional `--ladder`) to search for the least-diverged passing rewrite | Agent Layer B + optional `rewrite_text.py` | Meaning/style drift (least with `--minimal-select`, which needs a detector and costs more attempts) | No without vendor key/detector; **MarkLLM harness** (`detect_text_watermark.py`) verifies a specific scheme config before/after |
 | C2PA on PNG/JPEG/WebP/AVIF/HEIC | Drop APP11 / PNG `caBX` / RIFF `C2PA` / ISOBMFF `jumb` & `uuid` / exiftool | `clean_image.py` | Loses provenance metadata | Yes |
 | GIF comment/XMP extensions | Drop 0xFE / XMP application extensions (keep `NETSCAPE2.0`) | `clean_image.py` | Loses GIF comments/XMP | Yes (re-inspect) |
 | TIFF XMP/EXIF/GPS/IPTC/MakerNote (classic + BigTIFF) | Drop IFD tags, zero payloads, keep strip offsets | `clean_image.py` | Loses TIFF metadata | Yes (re-inspect) |
@@ -41,11 +41,14 @@
 
 | Strength | When |
 | --- | --- |
+| `minimal` | Gentlest; smallest possible edit, preserves structure/word order — pair with `--minimal-select` to search for the least-diverged passing candidate |
 | `paraphrase` | Default; explicit word-choice + syntax churn |
 | `humanize` | Zero-shot "write like a human" token reshuffle |
 | `backtranslate` | Stronger token reshuffle via pivot language |
 | `structural` | Strongest; most drift (outline → human prose) |
 | `code` | Comments/docstrings/string-literal wording + local identifier renames |
+
+`--ladder minimal,humanize,paraphrase` (or any subset of the strengths above) escalates through these in order, running a full evaluation round per level and moving up only when a level has zero passing candidates; combine with `--minimal-select` to keep the least-diverged pass at whichever level clears detection first.
 
 Frontier production watermarks are currently **token-by-token** (streaming
 constraint); paragraph-level robust methods (SemStamp / PostMark) are not yet

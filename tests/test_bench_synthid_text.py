@@ -22,10 +22,12 @@ sys.path.insert(0, str(SCRIPTS))
 
 import bench_synthid_text as bench
 from bench_synthid_text import (
+    VariantSpec,
     _parse_stats_json,
     aggregate,
     estimate_tokens,
     load_corpus,
+    parse_variant_specs,
     parse_variants,
 )
 
@@ -135,6 +137,76 @@ def test_parse_variants():
         parse_variants("")
 
 
+def test_parse_variant_specs_plain_is_backward_compatible():
+    """Plain <strength>:<candidates> items parse the same as parse_variants."""
+    specs = parse_variant_specs("paraphrase:1,backtranslate:3")
+    assert specs == [
+        VariantSpec("paraphrase:1", "paraphrase", 1),
+        VariantSpec("backtranslate:3", "backtranslate", 3),
+    ]
+    assert [s.ladder for s in specs] == [None, None]
+    assert [s.minimal_select for s in specs] == [False, False]
+
+
+def test_parse_variant_specs_minimal_strength():
+    """'minimal' is a valid plain strength (rewrite_text.py's new minimal-divergence prompt)."""
+    specs = parse_variant_specs("minimal:2")
+    assert specs == [VariantSpec("minimal:2", "minimal", 2)]
+
+
+def test_parse_variant_specs_minimal_select_suffix():
+    specs = parse_variant_specs("paraphrase:3:minimal-select")
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.strength == "paraphrase"
+    assert spec.candidates == 3
+    assert spec.ladder is None
+    assert spec.minimal_select is True
+    assert spec.label == "paraphrase:3:minimal-select"
+
+
+def test_parse_variant_specs_ladder():
+    specs = parse_variant_specs("ladder:minimal+humanize+paraphrase:3")
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.ladder == ("minimal", "humanize", "paraphrase")
+    assert spec.strength == "minimal"  # ladder[0], display/logging only
+    assert spec.candidates == 3
+    assert spec.minimal_select is False
+    assert spec.label == "ladder-minimal+humanize+paraphrase:3"
+
+
+def test_parse_variant_specs_ladder_with_minimal_select():
+    specs = parse_variant_specs("ladder:minimal+humanize:2:minimal-select")
+    spec = specs[0]
+    assert spec.ladder == ("minimal", "humanize")
+    assert spec.minimal_select is True
+    assert spec.label == "ladder-minimal+humanize:2:minimal-select"
+
+
+def test_parse_variant_specs_mixed_and_comma_split_is_unambiguous():
+    """A ladder's '+'-joined strength list must not be split by the outer
+    comma-separated --variants grammar."""
+    specs = parse_variant_specs("paraphrase:3,ladder:minimal+humanize+paraphrase:2,minimal:1")
+    assert [s.label for s in specs] == [
+        "paraphrase:3",
+        "ladder-minimal+humanize+paraphrase:2",
+        "minimal:1",
+    ]
+    assert specs[1].ladder == ("minimal", "humanize", "paraphrase")
+
+
+def test_parse_variant_specs_errors():
+    with pytest.raises(SystemExit):
+        parse_variant_specs("ladder:minimal+bogus-strength:2")
+    with pytest.raises(SystemExit):
+        parse_variant_specs("ladder:minimal:notanumber")
+    with pytest.raises(SystemExit):
+        parse_variant_specs("ladder:minimal")  # missing candidates
+    with pytest.raises(SystemExit):
+        parse_variant_specs("")
+
+
 def test_load_corpus(tmp_path):
     (tmp_path / "a.txt").write_text("seed one", encoding="utf-8")
     (tmp_path / "b.txt").write_text("seed two", encoding="utf-8")
@@ -159,6 +231,70 @@ def test_parse_stats_json_skips_warning_lines():
 def test_estimate_tokens():
     assert estimate_tokens("x" * 100, 4.0) == 25
     assert estimate_tokens("", 4.0) == 1
+
+
+def test_run_rewrite_threads_ladder_and_minimal_select_flags(monkeypatch):
+    """run_rewrite adds --ladder/--minimal-select to the rewrite_text.py
+    subprocess only when the caller passes them; the legacy cmd shape is
+    unchanged otherwise."""
+    captured = {}
+
+    class _FakeProc:
+        def __init__(self, cmd):
+            self.returncode = 0
+            self.stdout = ""
+            out_path = cmd[cmd.index("-o") + 1]
+            Path(out_path).write_text("rewritten text", encoding="utf-8")
+            self.stderr = json.dumps({"mode": "rewritten", "markllm": {"cleared": True}})
+
+    def fake_run_cmd(cmd, *, timeout):
+        captured["cmd"] = cmd
+        return _FakeProc(cmd)
+
+    monkeypatch.setattr(bench, "_run_cmd", fake_run_cmd)
+
+    common_kwargs = dict(
+        backend="ollama",
+        model="llama3.2",
+        base_url="http://127.0.0.1:11434",
+        candidates=2,
+        max_loops=1,
+        temperature=0.9,
+        timeout=30.0,
+        allow_remote=False,
+        api_key=None,
+        markllm_model="facebook/opt-1.3b",
+        markllm_timeout=60.0,
+        markllm_scheme="synthid",
+    )
+
+    out_text, stats = bench.run_rewrite(
+        "python3",
+        Path("rewrite_text.py"),
+        Path("upstream"),
+        "original text",
+        strength="minimal",
+        ladder=["minimal", "humanize"],
+        minimal_select=True,
+        **common_kwargs,
+    )
+    assert out_text == "rewritten text"
+    assert stats["mode"] == "rewritten"
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--ladder") + 1] == "minimal,humanize"
+    assert "--minimal-select" in cmd
+
+    bench.run_rewrite(
+        "python3",
+        Path("rewrite_text.py"),
+        Path("upstream"),
+        "original text",
+        strength="paraphrase",
+        **common_kwargs,
+    )
+    cmd2 = captured["cmd"]
+    assert "--ladder" not in cmd2
+    assert "--minimal-select" not in cmd2
 
 
 def test_aggregate_clear_rate_and_efficiency():
@@ -298,6 +434,70 @@ def test_run_variants_rows_and_clear_rate(tmp_path, monkeypatch):
     layer_a = next(r for r in rows if r["kind"] == "layer-a")
     assert layer_a["cleared"] is False
     assert any("no removal applied" in n for n in control["notes"])
+
+
+def _rewrite_stats_with_ladder():
+    return {
+        "mode": "rewritten",
+        "evaluator": "markllm",
+        "attempts_made": 4,
+        "passed": True,
+        "ladder": ["minimal", "humanize"],
+        "minimal_select": True,
+        "markllm": {
+            "before": dict(DETECT_POS),
+            "after": {"available": True, "is_watermarked": False, "score": -0.5},
+            "cleared": True,
+            "note": "same-config only",
+        },
+        "output_chars": 100,
+        "candidate_scores": [
+            {"level": "minimal", "passed": False, "lexical_divergence": 0.1, "selected": False},
+            {"level": "humanize", "passed": True, "lexical_divergence": 0.5, "selected": False},
+            {"level": "humanize", "passed": True, "lexical_divergence": 0.3, "selected": True},
+        ],
+    }
+
+
+def test_run_variants_records_ladder_level_and_minimal_select_narrowing(tmp_path, monkeypatch):
+    """A ladder:...:minimal-select variant records which level was selected
+    and notes when minimal-select beat the first passing candidate."""
+    b, _ = _make_bench(
+        tmp_path,
+        monkeypatch,
+        docs=1,
+        variants="ladder:minimal+humanize:3:minimal-select",
+    )
+
+    def fake_rewrite(text, strength, candidates, max_loops=1, *, ladder=None, minimal_select=False):
+        assert ladder == ["minimal", "humanize"]
+        assert minimal_select is True
+        return text + " rewritten", _rewrite_stats_with_ladder()
+
+    monkeypatch.setattr(b, "rewrite", fake_rewrite)
+    samples = b.generate_samples(tmp_path / "work")
+    rows = b.run_variants(samples, tmp_path / "work")
+    rewrite_rows = [r for r in rows if r["kind"] == "rewrite"]
+    assert len(rewrite_rows) == 1
+    row = rewrite_rows[0]
+    assert row["variant"] == "rewrite-ladder-minimal+humanize:3:minimal-select"
+    assert row["selected_level"] == "humanize"
+    assert row["minimal_select"] is True
+    assert row["ladder"] == ["minimal", "humanize"]
+    assert any("minimal-select narrowed" in n for n in row["notes"])
+
+
+def test_run_variants_plain_variant_calls_rewrite_with_legacy_signature(tmp_path, monkeypatch):
+    """A plain (non-ladder, non-minimal-select) variant still calls
+    self.rewrite with exactly the old 3-positional-arg shape, so a test
+    double written before ladder/minimal-select support keeps working."""
+    b, _ = _make_bench(tmp_path, monkeypatch, docs=1, variants="paraphrase:1")
+    samples = b.generate_samples(tmp_path / "work")
+    rows = b.run_variants(samples, tmp_path / "work")
+    rewrite_rows = [r for r in rows if r["kind"] == "rewrite"]
+    assert len(rewrite_rows) == 1
+    assert rewrite_rows[0]["minimal_select"] is False
+    assert rewrite_rows[0]["ladder"] is None
 
 
 def test_rewrite_failure_is_recorded_not_fatal(tmp_path, monkeypatch):

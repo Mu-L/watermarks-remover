@@ -42,7 +42,7 @@ import threading
 import time
 from pathlib import Path
 from shutil import which
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -50,7 +50,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from common import eprint, subprocess_creationflags  # noqa: E402
 from detect_text_watermark import SCHEMES  # noqa: E402  (single source of scheme names)
-from rewrite_text import _lexical_divergence  # noqa: E402
+from rewrite_text import STRENGTH_CHOICES, _lexical_divergence  # noqa: E402
 from text_unicode import clean_text  # noqa: E402
 
 _RESOLVED_SCRIPT = Path(__file__).resolve()
@@ -100,6 +100,134 @@ def parse_variants(spec: str) -> list[tuple[str, int]]:
     if not variants:
         raise SystemExit("error: --variants must name at least one variant")
     return variants
+
+
+class VariantSpec(NamedTuple):
+    """One parsed --variants item: a plain strength or a ladder escalation.
+
+    label is the string that follows "rewrite-"/"restamp-" in variant names,
+    CSV rows, and the report table, e.g. "paraphrase:3",
+    "paraphrase:3:minimal-select", or "ladder-minimal+humanize+paraphrase:3".
+
+    strength is the rewrite_text.py --strength value; for a ladder variant
+    it is ladder[0] (display/logging only — rewrite_text.py's --ladder
+    overrides --strength once set).
+    """
+
+    label: str
+    strength: str
+    candidates: int
+    ladder: tuple[str, ...] | None = None
+    minimal_select: bool = False
+
+
+def _parse_candidate_count(item: str, raw_c: str) -> int:
+    try:
+        c = int(raw_c)
+    except ValueError:
+        raise SystemExit(f"error: bad candidate count in variant {item!r}") from None
+    if c < 1:
+        raise SystemExit(f"error: candidate count must be >= 1 in variant {item!r}")
+    return c
+
+
+def parse_variant_specs(spec: str) -> list[VariantSpec]:
+    """Parse a --variants spec into VariantSpecs, extending parse_variants's
+    grammar with strength-escalation ladders and per-variant minimal-divergence
+    selection (both from rewrite_text.py's rewrite(); see its --ladder /
+    --minimal-select).
+
+    Grammar (comma-separated items; each item is one of):
+
+      <strength>:<candidates>
+          Plain variant, unchanged from parse_variants — e.g. "paraphrase:3"
+          or "minimal:2". strength is any rewrite_text.py --strength value
+          (this parser does not validate it; the choice is enforced when
+          rewrite_text.py runs). candidates is the max rewrite attempts per
+          input (rewrite_text.py --candidates).
+
+      <strength>:<candidates>:minimal-select
+          Same, plus per-variant --minimal-select: within one round, every
+          candidate is generated and evaluated, and the least-divergent
+          PASSING one is kept instead of stopping at the first pass. Requires
+          a detector, which the benchmark always configures for the whole
+          run (--scheme/--markllm-dir drive MarkLLM detection), so no extra
+          setup is needed here.
+
+      ladder:<strength1>+<strength2>+...:<candidates>
+          Strength escalation (rewrite_text.py --ladder), e.g.
+          "ladder:minimal+humanize+paraphrase:3". The strength list is
+          '+'-joined, not comma-joined, so it cannot collide with the outer
+          comma-separated --variants list (rewrite_text.py's own --ladder
+          flag uses commas for this same list; the benchmark spec uses '+'
+          on purpose to keep the top-level comma-split unambiguous).
+          Strengths must be valid rewrite_text.py --strength choices.
+
+      ladder:<strength1>+<strength2>+...:<candidates>:minimal-select
+          Ladder escalation with --minimal-select.
+
+    Examples:
+      "paraphrase:3,minimal:2"
+      "minimal:3:minimal-select"
+      "ladder:minimal+humanize+paraphrase:3"
+      "ladder:minimal+humanize+paraphrase:3:minimal-select"
+    """
+    specs: list[VariantSpec] = []
+    for raw_item in spec.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        parts = [p.strip() for p in item.split(":")]
+        minimal_select = False
+        if parts and parts[-1] == "minimal-select":
+            minimal_select = True
+            parts = parts[:-1]
+        if parts and parts[0] == "ladder":
+            if len(parts) != 3:
+                raise SystemExit(
+                    f"error: bad ladder variant {item!r}; expected "
+                    "ladder:<strength1>+<strength2>+...:<candidates>[:minimal-select]"
+                )
+            _tag, strength_list, raw_c = parts
+            ladder = tuple(s.strip() for s in strength_list.split("+") if s.strip())
+            if not ladder:
+                raise SystemExit(f"error: ladder variant {item!r} lists no strengths")
+            bad = [s for s in ladder if s not in STRENGTH_CHOICES]
+            if bad:
+                raise SystemExit(
+                    f"error: ladder variant {item!r} has unknown strength(s): {', '.join(bad)}"
+                )
+            candidates = _parse_candidate_count(item, raw_c)
+            label = f"ladder-{'+'.join(ladder)}:{candidates}"
+            if minimal_select:
+                label += ":minimal-select"
+            specs.append(
+                VariantSpec(
+                    label, ladder[0], candidates, ladder=ladder, minimal_select=minimal_select
+                )
+            )
+            continue
+        if len(parts) != 2:
+            raise SystemExit(f"error: bad variant {item!r}; expected <strength>:<candidates>")
+        strength, raw_c = parts
+        candidates = _parse_candidate_count(item, raw_c)
+        label = f"{strength}:{candidates}"
+        if minimal_select:
+            label += ":minimal-select"
+        specs.append(VariantSpec(label, strength, candidates, minimal_select=minimal_select))
+    if not specs:
+        raise SystemExit("error: --variants must name at least one variant")
+    return specs
+
+
+def _variant_label(v: tuple[str, int] | VariantSpec) -> str:
+    """Display label for one variant: a VariantSpec's own label, or
+    "<strength>:<candidates>" for a plain (strength, candidates) tuple
+    (parse_variants's legacy return shape, still accepted by aggregate())."""
+    if isinstance(v, VariantSpec):
+        return v.label
+    strength, candidates = v
+    return f"{strength}:{candidates}"
 
 
 def _base_url_is_loopback(base_url: str) -> bool:
@@ -334,6 +462,8 @@ def run_rewrite(
     markllm_model: str,
     markllm_timeout: float,
     markllm_scheme: str,
+    ladder: list[str] | None = None,
+    minimal_select: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Run the Layer B rewrite on *text* via rewrite_text.py (real product path).
 
@@ -341,6 +471,10 @@ def run_rewrite(
     passed plus markllm.before/after/cleared (always present: the bench passes
     --markllm-scheme, so MarkLLM drives the iterative rewrite loop). Errors
     raise RuntimeError so callers record a note.
+
+    ladder/minimal_select mirror rewrite_text.py's own --ladder /
+    --minimal-select flags (see its docstring); both are opt-in and, when
+    unset, leave the subprocess command identical to before.
     """
     import tempfile
 
@@ -385,6 +519,10 @@ def run_rewrite(
     ]
     if allow_remote:
         cmd.append("--allow-remote")
+    if ladder:
+        cmd += ["--ladder", ",".join(ladder)]
+    if minimal_select:
+        cmd.append("--minimal-select")
     try:
         try:
             proc = _run_cmd(cmd, timeout=max(timeout + 60, markllm_timeout + 60))
@@ -461,6 +599,41 @@ def _quality(original: str, candidate: str, chars_per_token: float) -> dict[str,
         "tokens_in": estimate_tokens(original, chars_per_token),
         "tokens_out": estimate_tokens(candidate, chars_per_token),
     }
+
+
+def _annotate_minimal_select(row: dict[str, Any], stats: dict[str, Any]) -> None:
+    """Record ladder/minimal-select outcome on *row* from one rewrite's stats.
+
+    Sets row["ladder"] (the escalation list, if any), row["minimal_select"]
+    (whether the variant used it), and row["selected_level"] (which ladder
+    level the returned candidate came from — the same as the single strength
+    for a non-ladder variant). When minimal_select found a less-diverged
+    PASSING candidate than the first one that would have passed under the
+    legacy first-pass-wins behavior, appends a note quantifying that so the
+    report can show it worked.
+    """
+    row["ladder"] = stats.get("ladder")
+    row["minimal_select"] = bool(stats.get("minimal_select"))
+    candidate_scores = stats.get("candidate_scores") or []
+    selected = next((c for c in candidate_scores if c.get("selected")), None)
+    row["selected_level"] = selected.get("level") if selected else None
+    if not row["minimal_select"] or selected is None:
+        return
+    same_level = [c for c in candidate_scores if c.get("level") == row["selected_level"]]
+    first_pass = next((c for c in same_level if c.get("passed") is True), None)
+    if first_pass is None:
+        return
+    selected_div = selected.get("lexical_divergence")
+    first_div = first_pass.get("lexical_divergence")
+    if (
+        isinstance(selected_div, (int, float))
+        and isinstance(first_div, (int, float))
+        and selected_div < first_div
+    ):
+        row.setdefault("notes", []).append(
+            f"minimal-select narrowed divergence: first-pass-wins would have picked "
+            f"{first_div:.4f}, minimal-select picked {selected_div:.4f}"
+        )
 
 
 def _score_of(d: dict[str, Any] | None) -> float | None:
@@ -623,7 +796,7 @@ class Benchmark:
         self.script = SCRIPTS_DIR / "detect_text_watermark.py"
         self.rewrite_script = SCRIPTS_DIR / "rewrite_text.py"
         self.python = str(_venv_python(upstream) or sys.executable)
-        self.variants = parse_variants(args.variants)
+        self.variants = parse_variant_specs(args.variants)
         self.corpus = load_corpus(args.corpus, args.docs)
         self.chars_per_token = args.chars_per_token
         self.scheme = args.scheme
@@ -696,7 +869,14 @@ class Benchmark:
         )
 
     def rewrite(
-        self, text: str, strength: str, candidates: int, max_loops: int = 1
+        self,
+        text: str,
+        strength: str,
+        candidates: int,
+        max_loops: int = 1,
+        *,
+        ladder: list[str] | None = None,
+        minimal_select: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         a = self.args
         return run_rewrite(
@@ -717,7 +897,27 @@ class Benchmark:
             markllm_model=a.markllm_model,
             markllm_timeout=a.markllm_timeout,
             markllm_scheme=self.scheme,
+            ladder=ladder,
+            minimal_select=minimal_select,
         )
+
+    def _run_rewrite_variant(self, text: str, spec: VariantSpec) -> tuple[str, dict[str, Any]]:
+        """Call self.rewrite for one VariantSpec.
+
+        Plain variants (no ladder, no minimal_select) call self.rewrite with
+        exactly the legacy 3 positional args (text, strength, candidates), so
+        a test double patched with that older signature keeps working
+        unchanged; ladder/minimal-select variants pass the extra keyword args.
+        """
+        if spec.ladder or spec.minimal_select:
+            return self.rewrite(
+                text,
+                spec.strength,
+                spec.candidates,
+                ladder=list(spec.ladder) if spec.ladder else None,
+                minimal_select=spec.minimal_select,
+            )
+        return self.rewrite(text, spec.strength, spec.candidates)
 
     # -- phases ------------------------------------------------------------
 
@@ -812,11 +1012,11 @@ class Benchmark:
             )
 
             # Layer B rewrites.
-            for strength, candidates in self.variants:
-                variant = f"rewrite-{strength}:{candidates}"
+            for spec in self.variants:
+                variant = f"rewrite-{spec.label}"
                 started = time.monotonic()
                 try:
-                    out_text, stats = self.rewrite(wm_text, strength, candidates)
+                    out_text, stats = self._run_rewrite_variant(wm_text, spec)
                     rewrite_seconds = round(time.monotonic() - started, 3)
                 except RuntimeError as e:
                     rows.append(
@@ -874,21 +1074,22 @@ class Benchmark:
                         "attempts_made",
                         "passed",
                         "mode",
+                        "ladder",
+                        "minimal_select",
                     )
                     if k in stats
                 }
+                _annotate_minimal_select(row, stats)
                 rows.append(row)
 
             # Optional re-stamp control: rewrite the UNwatermarked text; a
             # positive after-detection means the backend re-stamped it (or the
             # detector false-positives post-rewrite).
             if self.args.restamp_control:
-                for strength, candidates in self.variants:
-                    variant = f"restamp-{strength}:{candidates}"
+                for spec in self.variants:
+                    variant = f"restamp-{spec.label}"
                     try:
-                        out_text, _stats = self.rewrite(
-                            sample["unwatermarked"], strength, candidates
-                        )
+                        out_text, _stats = self._run_rewrite_variant(sample["unwatermarked"], spec)
                     except RuntimeError as e:
                         rows.append(
                             {
@@ -982,12 +1183,14 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values)
 
 
-def aggregate(rows: list[dict[str, Any]], variants: list[tuple[str, int]]) -> dict[str, Any]:
+def aggregate(
+    rows: list[dict[str, Any]], variants: list[tuple[str, int] | VariantSpec]
+) -> dict[str, Any]:
     by_variant: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = ["control", "layer-a"]
-    order += [f"rewrite-{s}:{c}" for s, c in variants]
+    order += [f"rewrite-{_variant_label(v)}" for v in variants]
     if any(r["kind"] == "restamp" for r in rows):
-        order += [f"restamp-{s}:{c}" for s, c in variants]
+        order += [f"restamp-{_variant_label(v)}" for v in variants]
     for row in rows:
         by_variant.setdefault(row["variant"], []).append(row)
 
@@ -1013,6 +1216,13 @@ def aggregate(rows: list[dict[str, Any]], variants: list[tuple[str, int]]) -> di
         mean_tokens_out = _mean(tokens_out) if tokens_out else None
         scores_before = [r["score_before"] for r in group if r.get("score_before") is not None]
         scores_after = [r["score_after"] for r in group if r.get("score_after") is not None]
+        levels = [r["selected_level"] for r in group if r.get("selected_level")]
+        narrowed = sum(
+            1
+            for r in group
+            for n in (r.get("notes") or [])
+            if isinstance(n, str) and "minimal-select narrowed" in n
+        )
         entries: dict[str, Any] = {
             "n": len(group),
             "before_positive": before_pos,
@@ -1045,6 +1255,10 @@ def aggregate(rows: list[dict[str, Any]], variants: list[tuple[str, int]]) -> di
             "notes": sorted(
                 {n for r in group for n in (r.get("notes") or []) if isinstance(n, str)}
             ),
+            "ladder_levels": (
+                {lvl: levels.count(lvl) for lvl in sorted(set(levels))} if levels else None
+            ),
+            "minimal_select_narrowed": narrowed or None,
         }
         out[variant] = entries
     return out
@@ -1081,7 +1295,11 @@ def render_markdown(
         "Each sample must pass a sanity gate (watermarked detected, non-empty) before it "
         "counts. Rows: control (no removal), layer-a (Unicode scrub only), "
         "rewrite-<strength>:<candidates> (Layer B rewrite), optional restamp-* "
-        "(rewrite of the unwatermarked control to detect re-stamping)."
+        "(rewrite of the unwatermarked control to detect re-stamping). "
+        "--variants also accepts ladder:<s1>+<s2>+...:<candidates> (strength "
+        "escalation) and a trailing :minimal-select suffix (evaluate every "
+        "candidate and keep the least-diverged PASSING one instead of the "
+        "first pass); see docs/synthid-text-benchmark.md."
     )
     L.append("")
     L.append(
@@ -1137,6 +1355,15 @@ def render_markdown(
                 )
     else:
         L.append("- Re-stamp control: not run (pass --restamp-control)")
+    for v, a in agg.items():
+        if a.get("minimal_select_narrowed"):
+            L.append(
+                f"- {v}: minimal-select picked a less-diverged passing candidate than "
+                f"first-pass-wins on {a['minimal_select_narrowed']}/{a['n']} row(s)"
+            )
+        if a.get("ladder_levels"):
+            levels_str = ", ".join(f"{lvl}={n}" for lvl, n in a["ladder_levels"].items())
+            L.append(f"- {v}: ladder level selected per row — {levels_str}")
     L.append("")
     L.append("## Reproduction")
     L.append("")
@@ -1173,9 +1400,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--variants",
         default="paraphrase:3",
-        help="Comma list of <strength>:<candidates> (default: paraphrase:3). "
-        "candidates = max rewrite attempts per input; the Layer B loop stops "
-        "early when an attempt passes evaluation.",
+        help="Comma list of variant specs (default: paraphrase:3). Each item "
+        "is <strength>:<candidates> (candidates = max rewrite attempts per "
+        "input; the Layer B loop stops early when an attempt passes "
+        "evaluation), optionally suffixed :minimal-select (evaluate every "
+        "candidate and keep the least-diverged PASSING one instead of the "
+        "first pass), or ladder:<s1>+<s2>+...:<candidates> for a strength "
+        "escalation (rewrite_text.py --ladder; note '+' joins the strength "
+        "list, not ',', so it does not collide with this option's own "
+        "comma-separated items). Example: "
+        "'paraphrase:3,ladder:minimal+humanize+paraphrase:3:minimal-select'. "
+        "See docs/synthid-text-benchmark.md.",
     )
     p.add_argument(
         "--restamp-control", action="store_true", help="Also rewrite the unwatermarked control"
@@ -1274,7 +1509,7 @@ def main() -> int:
         "markllm_model": args.markllm_model,
         "scheme": args.scheme,
         "config": str(args.config) if args.config else None,
-        "variants": [f"{s}:{c}" for s, c in bench.variants],
+        "variants": [_variant_label(v) for v in bench.variants],
         "corpus": str(args.corpus),
         "docs": args.docs,
         "seeds": args.seeds,
@@ -1339,7 +1574,8 @@ def main() -> int:
     csv_lines = [
         "doc,seed,variant,kind,attempts,evaluator,passed,before_pos,after_pos,cleared,"
         "score_before,score_after,score_delta,lexical_divergence,length_ratio,"
-        "numbers_preserved,urls_preserved,tokens_in,tokens_out,seconds,usd,notes"
+        "numbers_preserved,urls_preserved,tokens_in,tokens_out,seconds,usd,"
+        "ladder_level,minimal_select,notes"
     ]
     for r in rows:
         q = r.get("quality") or {}
@@ -1373,6 +1609,8 @@ def main() -> int:
                     q.get("tokens_out", ""),
                     r.get("seconds", ""),
                     round(r.get("usd") or 0.0, 6),
+                    r.get("selected_level", "") or "",
+                    "" if r.get("minimal_select") is None else (1 if r["minimal_select"] else 0),
                     "; ".join(str(n) for n in r.get("notes") or []),
                 )
             )

@@ -66,6 +66,38 @@ count, and paraphrase:3 means "try up to 3 variants, stop on the first pass"
 The report's att column (and mean_attempts in results.json / attempts in
 results.csv) records the actual attempts per document.
 
+**Minimum-divergence search variants:** `--variants` additionally accepts, per
+comma-separated item:
+
+- `<strength>:<candidates>:minimal-select` — per-variant
+  `rewrite_text.py --minimal-select`: within one evaluation round, every
+  candidate is generated and evaluated, and the least lexically-diverged
+  **passing** one is kept instead of stopping at the first pass. No extra
+  setup is needed — the benchmark already runs a MarkLLM detector for the
+  whole run.
+- `ladder:<strength1>+<strength2>+...:<candidates>` — a strength-escalation
+  ladder (`rewrite_text.py --ladder`): each level runs a full round before
+  escalating, and escalation happens only when a level has zero passing
+  candidates. The strength list is joined with `+`, not `,`, so it cannot
+  collide with the outer comma-separated `--variants` list (rewrite_text.py's
+  own `--ladder` flag uses commas for the same list; the `+` here is deliberate).
+  A ladder variant can also carry `:minimal-select` as a trailing suffix.
+
+Rows/labels for these variants follow the existing `rewrite-<label>` /
+`restamp-<label>` naming, e.g. `rewrite-paraphrase:3:minimal-select` or
+`rewrite-ladder-minimal+humanize+paraphrase:3`; results.json/results.csv also
+record, per row, which ladder level the returned candidate came from
+(`selected_level` / `ladder_level`) and whether minimal-select found a less
+diverged passing candidate than plain first-pass-wins would have.
+
+    # minimal-divergence search: try minimal, then escalate to humanize, then
+    # paraphrase, keeping the least-diverged passer at whichever level clears
+    python3 service/scripts/bench_synthid_text.py \
+      --markllm-dir ~/MarkLLM \
+      --variants "ladder:minimal+humanize+paraphrase:3:minimal-select" \
+      --rewrite-backend ollama --rewrite-model llama3.2 \
+      --out-dir out/bench-ladder
+
 Cost warning: with MarkLLM as the evaluator, each attempt also costs one
 MarkLLM detection — up to (candidates x loops) detections per input. The
 persistent serve worker (default) keeps the model loaded so detections are

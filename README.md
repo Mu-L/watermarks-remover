@@ -732,6 +732,86 @@ lexical-divergence selection. When the max is exhausted without a pass, the
 least-watermarked (lowest score) attempt is returned as best-effort with a
 note.
 
+**Minimum-divergence search (`--minimal-select`, `--ladder`):** by default a
+round stops at the first attempt that clears evaluation, at whatever
+`--strength` produced (`paraphrase` by default) — one aggressive
+whole-document rewrite. `--minimal-select` searches for a gentler rewrite
+that still clears detection: it generates and evaluates every `--candidates`
+variant in the round (no early stop) and returns the least
+lexically-diverged *passing* one. It requires a detector —
+`--markllm-scheme` or `--gumbel-key` / `WATERMARKS_GUMBEL_KEY` — and fails
+fast otherwise:
+
+```
+error: --minimal-select requires a detector: pass --markllm-scheme or --gumbel-key (env: WATERMARKS_GUMBEL_KEY)
+```
+
+Pair it with the new `minimal` strength — the gentlest tier, instructed to
+preserve sentence structure, word order, facts, numbers, names, URLs, and
+technical identifiers and change only as few words as necessary — and with
+`--ladder`, a comma-separated strength-escalation sequence (values from
+`--strength`'s choices) that overrides `--strength` as the level list:
+
+```bash
+export WATERMARKS_REWRITE_BACKEND=ollama WATERMARKS_REWRITE_MODEL=llama3.2
+export WATERMARKS_GUMBEL_KEY=0x...
+python3 "$SCRIPTS/rewrite_text.py" wm.txt -o wm.rewritten.txt \
+  --minimal-select --ladder minimal,humanize,paraphrase \
+  --candidates 3 --json-stats
+```
+
+Each ladder level runs a full round (`--candidates` × `--max-loops`
+attempts) before escalating; escalation happens only when a level has zero
+passing candidates, and once a level has any pass, later levels never run —
+so `minimal,humanize,paraphrase` only reaches `paraphrase` if both gentler
+tiers fail to clear detection entirely. `--ladder` works without
+`--minimal-select` too: it still stops at the first pass within whichever
+level is running, just tries a gentler strength first. Both flags are
+CLI-only (no environment-variable equivalent) and strictly opt-in: without
+them, the candidates/max-loops/first-pass-wins behavior above is unchanged.
+
+`--json-stats` adds `ladder` (the resolved level list) and `minimal_select:
+true` at the top level, plus `level` and `entity_drift` on each
+`candidate_scores` entry — `level` is the ladder strength that produced that
+attempt, and `entity_drift` is a **reporting-only, unenforced** check of
+whether the original text's URLs and numbers survived in that candidate; it's
+regex-based, not NER, so it says nothing about proper names or other
+identifiers despite the prompts asking the model to preserve them:
+
+```json
+{
+  "ladder": ["minimal", "humanize", "paraphrase"],
+  "minimal_select": true,
+  "evaluator": "gumbel",
+  "candidates": 1,
+  "max_loops": 1,
+  "attempts_made": 2,
+  "passed": true,
+  "candidate_scores": [
+    {
+      "loop": 0,
+      "level": "minimal",
+      "lexical_divergence": 0.12,
+      "selection_score": 0.12,
+      "selected": false,
+      "passed": false,
+      "evaluation": {"detector": "gumbel", "available": true, "is_watermarked": true, "score": 5.1},
+      "entity_drift": {"urls_preserved": true, "urls_missing": [], "numbers_preserved": true, "numbers_missing": []}
+    },
+    {
+      "loop": 0,
+      "level": "humanize",
+      "lexical_divergence": 0.58,
+      "selection_score": 0.58,
+      "selected": true,
+      "passed": true,
+      "evaluation": {"detector": "gumbel", "available": true, "is_watermarked": false, "score": 1.2},
+      "entity_drift": {"urls_preserved": true, "urls_missing": [], "numbers_preserved": false, "numbers_missing": ["42"]}
+    }
+  ]
+}
+```
+
 If the backend is unconfigured or its deps are missing, the rewrite proceeds
 and the report notes verification was unavailable. A GPU is recommended; CPU
 runs work but are slow, and the model download is a few GB.
@@ -1197,10 +1277,33 @@ make smoke                          # quick CLI smoke on fixtures
   `max_loops` / `attempts_made` / `passed` and per-attempt
   `candidate_scores` records (`loop`, `passed`, `evaluation`);
   `markllm.before/after/cleared` is unchanged.
+- **Minimum-divergence search for Layer B**: new `minimal` strength (gentlest
+  tier: preserve sentence structure/word order/facts/numbers/names/URLs,
+  change as few words as possible); `--minimal-select` (opt-in, requires
+  `--markllm-scheme` or `--gumbel-key`/`WATERMARKS_GUMBEL_KEY`, else fails
+  fast) evaluates every `--candidates` variant in a round instead of stopping
+  at the first pass, and returns the least lexically-diverged *passing* one;
+  `--ladder` (opt-in, e.g. `minimal,humanize,paraphrase`) escalates through
+  strength levels, running a full round per level and moving to the next
+  only when a level has zero passing candidates, overriding `--strength`.
+  CLI-only, no new env vars. `--json-stats` gains `ladder` / `minimal_select`
+  and per-attempt `level` / `entity_drift` (reporting-only, regex-based URL/
+  number survival check, not enforced and not NER). Backward compatible:
+  both flags are off by default and the existing first-pass-wins loop is
+  unchanged.
 - **SynthID-text benchmark**: default variants `paraphrase:3`; report and CSV
   now carry attempts per document (`mean_attempts`, `att` column;
   `attempts` / `evaluator` / `passed` columns); `--rewrite-loops`
   mirrors `--max-loops`.
+- **Benchmark support for minimum-divergence search**: `--variants` now also
+  accepts `<strength>:<candidates>:minimal-select` and
+  `ladder:<s1>+<s2>+...:<candidates>` (optionally `:minimal-select` too),
+  threading `rewrite_text.py --minimal-select`/`--ladder` through per
+  variant — e.g. `--variants "ladder:minimal+humanize+paraphrase:3:minimal-select"`.
+  results.json/results.csv gain `selected_level`/`ladder_level` (which
+  ladder level the kept candidate came from) and `minimal_select`; report.md
+  notes when minimal-select beat first-pass-wins. Additive: existing
+  `<strength>:<candidates>` specs, columns, and report layout are unchanged.
 - **Keyed-Gumbel (Aaronson EXP) same-key verification**: new stdlib-only
   `detect_gumbel.py` implements the model-free replay test of ARBI's keyed-Gumbel
   report (u = PRF(Hash(key, window), token); exact Gamma-tail p-value; repeated-

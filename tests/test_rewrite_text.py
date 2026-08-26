@@ -19,9 +19,12 @@ sys.path.insert(0, str(SCRIPTS))
 import rewrite_text
 from rewrite_text import (
     _check_remote,
+    _entity_drift,
     _flag_env,
+    _length_ratio_ok,
     _lexical_divergence,
     _select_candidate,
+    _select_min_divergence,
     build_prompt,
     rewrite,
 )
@@ -62,6 +65,29 @@ def test_build_prompt_humanize_and_code_contain_text():
 def test_build_prompt_unknown_strength_raises():
     with pytest.raises(ValueError):
         build_prompt("nope", "ABC", lang="French", original_lang="English")
+
+
+def test_build_prompt_minimal_is_change_as_little_as_possible():
+    p = build_prompt("minimal", "Hello world facts 42.", lang="French", original_lang="English")
+    assert "Hello world facts 42." in p
+    assert "changing as little as possible" in p
+
+
+def test_strength_choices_accepts_minimal():
+    args = rewrite_text.build_parser().parse_args(["--strength", "minimal", "x.txt"])
+    assert args.strength == "minimal"
+
+
+def test_main_minimal_select_without_detector_raises(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["rewrite_text.py", "--minimal-select", "-"])
+    with pytest.raises(SystemExit):
+        rewrite_text.main()
+
+
+def test_main_ladder_unknown_strength_raises(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["rewrite_text.py", "--ladder", "minimal,bogus", "-"])
+    with pytest.raises(SystemExit):
+        rewrite_text.main()
 
 
 def test_print_prompt_backend():
@@ -432,6 +458,264 @@ def test_single_candidate_attempt(monkeypatch):
     assert len(info["candidate_scores"]) == 1
     assert info["candidate_scores"][0]["selected"] is True
     assert info["markllm"]["cleared"] is True
+
+
+# ---------------------------------------------------------------------------
+# Minimum-divergence search: --minimal-select and --ladder
+# ---------------------------------------------------------------------------
+
+
+def test_rewrite_minimal_select_without_detector_raises_systemexit():
+    with pytest.raises(SystemExit):
+        rewrite(
+            "the cat sat on the mat",
+            **_rewrite_candidates_kwargs(minimal_select=True),
+        )
+
+
+class _PassesAllExceptOriginal:
+    """Stand-in detector: only the literal original text fails detection."""
+
+    name = "markllm"
+
+    def __init__(self, **kwargs):
+        pass
+
+    def available(self) -> bool:
+        return True
+
+    def detect(self, text: str) -> dict:
+        wm = text == "the cat sat on the mat"
+        return {
+            "detector": "markllm",
+            "available": True,
+            "is_watermarked": wm,
+            "score": 3.0 if wm else 0.5,
+        }
+
+
+def test_minimal_select_picks_least_divergent_passer(monkeypatch):
+    monkeypatch.setattr(rewrite_text, "MarkLLMTextDetector", _PassesAllExceptOriginal)
+    more_divergent = "the cat sat on the mat quickly today"
+    less_divergent = "the cat sat on the mat now"
+    texts = iter([more_divergent, less_divergent])
+    monkeypatch.setattr(rewrite_text, "call_ollama", lambda *a, **k: next(texts))
+    out, info = rewrite(
+        "the cat sat on the mat",
+        **_rewrite_candidates_kwargs(
+            candidates=2,
+            max_loops=1,
+            minimal_select=True,
+            markllm_scheme="kgw",
+            markllm_dir="/x",
+        ),
+    )
+    cs = info["candidate_scores"]
+    assert cs[0]["lexical_divergence"] > cs[1]["lexical_divergence"]
+    assert all(c["passed"] is True for c in cs)
+    # the least-divergent passer wins, not the first one generated
+    assert out == less_divergent
+    assert info["attempts_made"] == 2
+
+
+def test_minimal_select_generates_all_candidates_no_early_stop(monkeypatch):
+    monkeypatch.setattr(rewrite_text, "MarkLLMTextDetector", _PassesAllExceptOriginal)
+    texts = iter(
+        [
+            "alpha beta gamma delta",  # passes on the very first attempt
+            "alpha beta gamma delta epsilon",
+            "alpha beta gamma delta epsilon zeta",
+        ]
+    )
+    monkeypatch.setattr(rewrite_text, "call_ollama", lambda *a, **k: next(texts))
+    _out, info = rewrite(
+        "the cat sat on the mat",
+        **_rewrite_candidates_kwargs(
+            candidates=3,
+            max_loops=1,
+            minimal_select=True,
+            markllm_scheme="kgw",
+            markllm_dir="/x",
+        ),
+    )
+    # no early stop: every candidates x max_loops attempt is generated/evaluated
+    assert info["attempts_made"] == 3 * 1
+    assert all(c["passed"] is True for c in info["candidate_scores"])
+
+
+class _PassesOnlyParaphraseText:
+    """Stand-in detector: fails everything except one specific candidate."""
+
+    name = "markllm"
+
+    def __init__(self, **kwargs):
+        pass
+
+    def available(self) -> bool:
+        return True
+
+    def detect(self, text: str) -> dict:
+        wm = text != "paraphrase candidate"
+        return {
+            "detector": "markllm",
+            "available": True,
+            "is_watermarked": wm,
+            "score": 0.1 if not wm else 3.0,
+        }
+
+
+def test_ladder_escalates_when_level_has_zero_passes(monkeypatch):
+    monkeypatch.setattr(rewrite_text, "MarkLLMTextDetector", _PassesOnlyParaphraseText)
+    texts = iter(["minimal candidate", "paraphrase candidate"])
+    monkeypatch.setattr(rewrite_text, "call_ollama", lambda *a, **k: next(texts))
+    out, info = rewrite(
+        "the cat sat on the mat",
+        **_rewrite_candidates_kwargs(
+            candidates=1,
+            max_loops=1,
+            minimal_select=True,
+            ladder=["minimal", "paraphrase"],
+            markllm_scheme="kgw",
+            markllm_dir="/x",
+        ),
+    )
+    assert info["ladder"] == ["minimal", "paraphrase"]
+    assert out == "paraphrase candidate"
+    cs = info["candidate_scores"]
+    assert [c["level"] for c in cs] == ["minimal", "paraphrase"]
+    selected = [c for c in cs if c["selected"]]
+    assert len(selected) == 1
+    assert selected[0]["level"] == "paraphrase"
+    assert info["attempts_made"] == 2
+
+
+def test_ladder_does_not_escalate_when_first_level_passes(monkeypatch):
+    monkeypatch.setattr(rewrite_text, "MarkLLMTextDetector", _PassesAllExceptOriginal)
+    calls = {"n": 0}
+
+    def fake_call_ollama(*a, **k):
+        calls["n"] += 1
+        return "alpha beta gamma delta"
+
+    monkeypatch.setattr(rewrite_text, "call_ollama", fake_call_ollama)
+    _out, info = rewrite(
+        "the cat sat on the mat",
+        **_rewrite_candidates_kwargs(
+            candidates=1,
+            max_loops=1,
+            minimal_select=True,
+            ladder=["minimal", "paraphrase"],
+            markllm_scheme="kgw",
+            markllm_dir="/x",
+        ),
+    )
+    assert calls["n"] == 1  # paraphrase level never ran
+    assert info["candidate_scores"][0]["level"] == "minimal"
+    assert info["attempts_made"] == 1
+
+
+def test_info_omits_ladder_and_minimal_select_by_default():
+    _out, info = rewrite("Sample prose about water marks.", **_rewrite_kwargs())
+    assert "ladder" not in info
+    assert "minimal_select" not in info
+
+
+def test_info_includes_ladder_and_minimal_select_when_used():
+    _out, info = rewrite(
+        "Sample prose about water marks.",
+        **_rewrite_kwargs(ladder=["minimal", "paraphrase"], minimal_select=True),
+    )
+    assert info["ladder"] == ["minimal", "paraphrase"]
+    assert info["minimal_select"] is True
+
+
+def test_candidate_scores_include_level_and_entity_drift(monkeypatch):
+    monkeypatch.setattr(rewrite_text, "MarkLLMTextDetector", _FakeMarkLLM)
+    _two_candidates(monkeypatch)
+    _out, info = rewrite(
+        "the cat sat on the mat",
+        **_rewrite_candidates_kwargs(markllm_scheme="kgw", markllm_dir="/x"),
+    )
+    for rec in info["candidate_scores"]:
+        assert rec["level"] == "paraphrase"  # default strength, no ladder
+        assert set(rec["entity_drift"].keys()) == {
+            "urls_preserved",
+            "urls_missing",
+            "numbers_preserved",
+            "numbers_missing",
+        }
+
+
+def test_legacy_path_unchanged_with_explicit_defaults(monkeypatch):
+    """rewrite(minimal_select=False, ladder=None) must match pre-existing behavior."""
+    monkeypatch.setattr(rewrite_text, "MarkLLMTextDetector", _FakeMarkLLM)
+    _two_candidates(monkeypatch)
+    out, info = rewrite(
+        "the cat sat on the mat",
+        **_rewrite_candidates_kwargs(
+            markllm_scheme="kgw", markllm_dir="/x", minimal_select=False, ladder=None
+        ),
+    )
+    assert info["evaluator"] == "markllm"
+    assert out == "alpha beta gamma delta"
+    assert info["attempts_made"] == 2  # early-stop-on-first-pass: unchanged
+    assert info["passed"] is True
+    cs = info["candidate_scores"]
+    assert [c["passed"] for c in cs] == [False, True]
+    assert [c["selected"] for c in cs] == [False, True]
+    assert cs[0]["lexical_divergence"] == 0.0
+    assert cs[1]["lexical_divergence"] == 1.0
+    assert cs[0]["evaluation"]["is_watermarked"] is True
+    assert cs[1]["evaluation"]["is_watermarked"] is False
+    mk = info["markllm"]
+    assert mk["before"]["is_watermarked"] is True
+    assert mk["after"]["is_watermarked"] is False
+    assert mk["cleared"] is True
+    assert "ladder" not in info
+    assert "minimal_select" not in info
+
+
+# ---------------------------------------------------------------------------
+# Standalone helpers backing minimum-divergence search
+# ---------------------------------------------------------------------------
+
+
+def test_entity_drift_reports_missing_url_and_number():
+    original = "See https://example.com/a for 42 items and 7 more."
+    dropped_number = "See https://example.com/a for 42 items only."
+    drift = _entity_drift(original, dropped_number)
+    assert drift["urls_preserved"] is True
+    assert drift["urls_missing"] == []
+    assert drift["numbers_preserved"] is False
+    assert drift["numbers_missing"] == ["7"]
+
+    dropped_url = "See it for 42 items and 7 more."
+    drift2 = _entity_drift(original, dropped_url)
+    assert drift2["urls_preserved"] is False
+    assert drift2["urls_missing"] == ["https://example.com/a"]
+    assert drift2["numbers_preserved"] is True
+    assert drift2["numbers_missing"] == []
+
+
+def test_length_ratio_ok_bounds():
+    original = "a" * 100
+    assert _length_ratio_ok(original, "b" * 50)  # ratio 0.5, inclusive lo
+    assert _length_ratio_ok(original, "b" * 60)  # ratio 0.6, within bounds
+    assert _length_ratio_ok(original, "b" * 200)  # ratio 2.0, inclusive hi
+    assert not _length_ratio_ok(original, "b" * 40)  # ratio 0.4 < 0.5
+    assert not _length_ratio_ok(original, "b" * 250)  # ratio 2.5 > 2.0
+
+
+def test_select_min_divergence_prefers_guarded_over_out_of_range():
+    original = "x" * 100
+    guarded = ("y" * 60, {"lexical_divergence": 0.9})  # ratio 0.6: within guard
+    out_of_range = ("y" * 10, {"lexical_divergence": 0.1})  # ratio 0.1: outside guard
+
+    cand, _rec = _select_min_divergence(original, [out_of_range, guarded])
+    assert cand == guarded[0]  # guarded passer wins despite higher raw divergence
+
+    cand2, _rec2 = _select_min_divergence(original, [out_of_range])
+    assert cand2 == out_of_range[0]  # falls back when the guard eliminates everyone
 
 
 # ---------------------------------------------------------------------------

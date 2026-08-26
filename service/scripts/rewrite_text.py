@@ -27,6 +27,17 @@ attempts are generated and the most diverged one is selected). A vendor-detector
 seam (Google's retired SynthID-text detector) is reserved ahead of the
 same-config detectors should a vendor endpoint return.
 
+Minimum-divergence search (opt-in, requires a detector):
+  --minimal-select   Within one round, generate every --candidates variant,
+                      evaluate all of them, and select the least-divergent
+                      PASSING one instead of stopping at the first pass.
+  --ladder            Comma-separated strength escalation sequence, e.g.
+                      "minimal,humanize,paraphrase". Each level runs a full
+                      round before escalating; escalation happens only when a
+                      level has zero passing candidates. Overrides --strength.
+Both are opt-in and backward compatible: without them, the legacy
+first-pass-wins behavior described above is unchanged.
+
 Security notes:
   - Only http(s) endpoints are accepted; redirects are refused outright so an
     Authorization header (API key) can never be re-sent to an unvalidated host.
@@ -56,8 +67,16 @@ from text_unicode import clean_text
 DEFAULT_MARKLLM_MODEL = "facebook/opt-1.3b"
 DEFAULT_CANDIDATES = 1
 DEFAULT_MAX_LOOPS = 1
+STRENGTH_CHOICES = ("minimal", "paraphrase", "backtranslate", "structural", "humanize", "code")
 
 PROMPTS = {
+    "minimal": (
+        "Rewrite the following text, changing as little as possible. Preserve "
+        "sentence structure, word order, facts, numbers, names, URLs, and "
+        "technical identifiers. Replace only the smallest number of words "
+        "necessary to alter surface wording. Do not add, remove, or reorder "
+        "claims. Output only the rewritten text.\n\n---\n{TEXT}"
+    ),
     "paraphrase": (
         "Rewrite the following text so that it uses substantially different wording at "
         "the token level. Change clause order, connectors, and transition words; vary "
@@ -134,6 +153,57 @@ def _select_candidate(original: str, candidates: list[str]) -> tuple[str, list[f
         scores.append(score)
     best_idx = max(range(len(candidates)), key=lambda i: scores[i])
     return candidates[best_idx], scores
+
+
+def _length_ratio_ok(original: str, candidate: str, *, lo: float = 0.5, hi: float = 2.0) -> bool:
+    """True when candidate length is within [lo, hi] x original length.
+
+    An eligibility check (not a scoring penalty) for _select_min_divergence
+    below: guards the minimum-divergence pick against a same-looking
+    selection that is actually a near-empty or wildly padded rewrite.
+    """
+    if not original:
+        return True
+    ratio = len(candidate) / len(original)
+    return lo <= ratio <= hi
+
+
+_URL_RE = re.compile(r"https?://\S+")
+_NUMBER_RE = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\w])")
+
+
+def _entities(text: str) -> tuple[set[str], set[str]]:
+    """Cheap, stdlib-only proxy for "did the rewrite keep the load-bearing bits".
+
+    Regex-only: this is not named-entity recognition and does not check
+    proper names or technical identifiers beyond URLs/numbers — the prompts
+    ask the model to preserve those, but nothing here verifies it.
+    """
+    return set(_URL_RE.findall(text)), set(_NUMBER_RE.findall(text))
+
+
+def _entity_drift(original: str, candidate: str) -> dict:
+    """Report (never enforce) whether the original's URLs/numbers survived."""
+    o_urls, o_nums = _entities(original)
+    c_urls, c_nums = _entities(candidate)
+    return {
+        "urls_preserved": o_urls <= c_urls,
+        "urls_missing": sorted(o_urls - c_urls),
+        "numbers_preserved": o_nums <= c_nums,
+        "numbers_missing": sorted(o_nums - c_nums),
+    }
+
+
+def _select_min_divergence(original: str, passing: list[tuple[str, dict]]) -> tuple[str, dict]:
+    """Among candidates that already passed detection, pick the least-diverged one.
+
+    Prefers candidates within the _length_ratio_ok guard; falls back to the
+    full passing set only if the guard would eliminate every passer (a
+    rewrite that clears detection is returned over none at all).
+    """
+    guarded = [(c, r) for c, r in passing if _length_ratio_ok(original, c)]
+    pool = guarded or passing
+    return min(pool, key=lambda cr: cr[1]["lexical_divergence"])
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -246,6 +316,8 @@ def _generate_once(
 
 
 def build_prompt(strength: str, text: str, *, lang: str, original_lang: str) -> str:
+    if strength == "minimal":
+        return PROMPTS["minimal"].format(TEXT=text)
     if strength == "paraphrase":
         return PROMPTS["paraphrase"].format(TEXT=text)
     if strength == "humanize":
@@ -362,17 +434,24 @@ def rewrite(
     markllm_model: str | None = None,
     markllm_timeout: float = 180.0,
     gumbel_key: str | None = None,
+    minimal_select: bool = False,
+    ladder: list[str] | None = None,
 ) -> tuple[str, dict]:
-    prompt = build_prompt(strength, text, lang=lang, original_lang=original_lang)
+    strengths = list(ladder) if ladder else [strength]
+    first_prompt = build_prompt(strengths[0], text, lang=lang, original_lang=original_lang)
     info: dict = {
         "backend": backend,
         "strength": strength,
         "model": model,
         "base_url": base_url,
         "temperature": temperature,
-        "prompt_chars": len(prompt),
+        "prompt_chars": len(first_prompt),
         "input_chars": len(text),
     }
+    if ladder:
+        info["ladder"] = strengths
+    if minimal_select:
+        info["minimal_select"] = True
     if reasoning_effort:
         info["reasoning_effort"] = reasoning_effort
 
@@ -406,7 +485,9 @@ def rewrite(
         info["mode"] = "print-prompt"
         if candidates > 1:
             eprint("note: --candidates ignored in print-prompt mode")
-        return prompt, info
+        if ladder:
+            eprint("note: --ladder ignored in print-prompt mode (printing the first level only)")
+        return first_prompt, info
 
     if not model:
         raise SystemExit("error: --model required for ollama/openai-compatible backends")
@@ -422,52 +503,92 @@ def rewrite(
     evaluator_name, evaluator = _pick_evaluator(markllm_detector, gumbel_detector)
     info["evaluator"] = evaluator_name
 
-    # Iterative rewrite: each loop generates --candidates variants and
-    # evaluates them, stopping as soon as one passes; --max-loops caps how
-    # many evaluation rounds run before the best-effort variant is returned.
-    # When no detector is configured the evaluator is lexical divergence,
-    # which has no pass/fail verdict, so every attempt is generated and the
-    # most diverged one is selected (the original --candidates behavior).
+    if minimal_select and evaluator is None:
+        raise SystemExit(
+            "error: --minimal-select requires a detector "
+            "(--markllm-scheme or --gumbel-key / WATERMARKS_GUMBEL_KEY)"
+        )
+
+    # Iterative rewrite over one or more strength levels (--ladder; a single
+    # level when not set). Within a level, each loop generates --candidates
+    # variants and evaluates them.
+    #
+    # Legacy behavior (minimal_select=False): stop as soon as one attempt
+    # passes; --max-loops caps how many rounds run before the best-effort
+    # variant is returned. With no detector configured, the evaluator is
+    # lexical divergence (no pass/fail verdict), so every attempt is
+    # generated and the most diverged one is selected.
+    #
+    # --minimal-select: every attempt in a level is generated and evaluated
+    # (no early stop); the least-divergent PASSING attempt is selected and
+    # escalation to the next ladder level happens only when a level has zero
+    # passing candidates.
     attempts: list[tuple[str, dict]] = []
     passed: bool | None = None
-    for loop in range(n_loops):
-        for _ in range(n_cands):
-            cand = _generate_once(
-                backend, base_url, model, api_key, prompt, timeout, temperature, reasoning_effort
-            )
-            cand_stats: dict | None = None
-            if layer_a_after:
-                cand, cand_stats = clean_text(cand)
-            divergence = _lexical_divergence(text, cand)
-            if evaluator is None:
-                evaluation: dict = {
-                    "evaluator": "lexical-divergence",
-                    "score": round(divergence, 4),
-                }
-            else:
-                evaluation = _safe_detect(evaluator, cand)
-            verdict = evaluation.get("is_watermarked")
-            passed_i: bool | None = (
-                True if verdict is False else (False if verdict is True else None)
-            )
-            attempts.append(
-                (
-                    cand,
-                    {
-                        "loop": loop,
-                        "lexical_divergence": round(divergence, 4),
-                        "selection_score": round(divergence, 4),
-                        "selected": False,
-                        "passed": passed_i,
-                        "evaluation": evaluation,
-                        "layer_a_after": cand_stats,
-                    },
+    selected: tuple[str, dict] | None = None
+    for level_strength in strengths:
+        level_prompt = build_prompt(level_strength, text, lang=lang, original_lang=original_lang)
+        level_attempts: list[tuple[str, dict]] = []
+        stop = False
+        for loop in range(n_loops):
+            for _ in range(n_cands):
+                cand = _generate_once(
+                    backend,
+                    base_url,
+                    model,
+                    api_key,
+                    level_prompt,
+                    timeout,
+                    temperature,
+                    reasoning_effort,
                 )
-            )
-            if passed_i is True:
-                passed = True
+                cand_stats: dict | None = None
+                if layer_a_after:
+                    cand, cand_stats = clean_text(cand)
+                divergence = _lexical_divergence(text, cand)
+                if evaluator is None:
+                    evaluation: dict = {
+                        "evaluator": "lexical-divergence",
+                        "score": round(divergence, 4),
+                    }
+                else:
+                    evaluation = _safe_detect(evaluator, cand)
+                verdict = evaluation.get("is_watermarked")
+                passed_i: bool | None = (
+                    True if verdict is False else (False if verdict is True else None)
+                )
+                level_attempts.append(
+                    (
+                        cand,
+                        {
+                            "loop": loop,
+                            "level": level_strength,
+                            "lexical_divergence": round(divergence, 4),
+                            "selection_score": round(divergence, 4),
+                            "selected": False,
+                            "passed": passed_i,
+                            "evaluation": evaluation,
+                            "entity_drift": _entity_drift(text, cand),
+                            "layer_a_after": cand_stats,
+                        },
+                    )
+                )
+                if not minimal_select and passed_i is True:
+                    passed = True
+                    stop = True
+                    break
+            if stop:
                 break
-        if passed is True:
+        attempts.extend(level_attempts)
+
+        if minimal_select:
+            passing = [(c, r) for c, r in level_attempts if r["passed"] is True]
+            if passing:
+                passed = True
+                selected = _select_min_divergence(text, passing)
+                break
+            # zero passes at this level: fall through and escalate
+        elif passed is True:
             break
 
     if evaluator is not None and passed is None:
@@ -491,14 +612,18 @@ def rewrite(
             if isinstance(s, (int, float)) and (best_score is None or s < best_score):
                 best_score = float(s)
                 best_score_idx = i
-    if passed is True:
+
+    if selected is not None:
+        out, rec = selected
+    elif passed is True:
         selected_idx = len(attempts) - 1  # the passing attempt is the last one
+        out, rec = attempts[selected_idx]
     elif best_score_idx is not None:
         selected_idx = best_score_idx
+        out, rec = attempts[selected_idx]
     else:
         selected_idx = best_div_idx
-
-    out, rec = attempts[selected_idx]
+        out, rec = attempts[selected_idx]
     rec["selected"] = True
     info["candidate_scores"] = [r for _c, r in attempts]
     if layer_a_after:
@@ -599,8 +724,25 @@ def build_parser() -> argparse.ArgumentParser:
     # and shell history. Set WATERMARKS_REWRITE_API_KEY instead.
     p.add_argument(
         "--strength",
-        choices=("paraphrase", "backtranslate", "structural", "humanize", "code"),
+        choices=STRENGTH_CHOICES,
         default="paraphrase",
+    )
+    p.add_argument(
+        "--minimal-select",
+        action="store_true",
+        help="Within a round, generate every --candidates variant, evaluate "
+        "all of them, and select the least-divergent PASSING one instead of "
+        "stopping at the first pass. Requires a detector (--markllm-scheme "
+        "or --gumbel-key).",
+    )
+    p.add_argument(
+        "--ladder",
+        default=None,
+        help="Comma-separated strength escalation sequence, e.g. "
+        "'minimal,humanize,paraphrase' (values from --strength's choices). "
+        "Each level runs a full round (--candidates x --max-loops attempts) "
+        "before escalating; escalation happens only when a level has zero "
+        "passing candidates. Overrides --strength as the level list.",
     )
     p.add_argument("--lang", default="French", help="Pivot language for backtranslate")
     p.add_argument("--original-lang", default="English")
@@ -679,6 +821,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
+    ladder: list[str] | None = None
+    if args.ladder:
+        ladder = [s.strip() for s in args.ladder.split(",") if s.strip()]
+        bad = [s for s in ladder if s not in STRENGTH_CHOICES]
+        if bad:
+            raise SystemExit(f"error: --ladder has unknown strength(s): {', '.join(bad)}")
+        if not ladder:
+            raise SystemExit("error: --ladder must list at least one strength")
+
+    if args.minimal_select and not (args.markllm_scheme or args.gumbel_key):
+        raise SystemExit(
+            "error: --minimal-select requires a detector: pass --markllm-scheme "
+            "or --gumbel-key (env: WATERMARKS_GUMBEL_KEY)"
+        )
+
     text = read_text_input(args.path, allow_binary=args.force_text)
     allow_remote = (
         args.allow_remote
@@ -707,6 +864,8 @@ def main() -> int:
             markllm_model=args.markllm_model,
             markllm_timeout=args.markllm_timeout,
             gumbel_key=args.gumbel_key,
+            minimal_select=args.minimal_select,
+            ladder=ladder,
         )
     except (urllib.error.URLError, TimeoutError, RuntimeError) as e:
         eprint(f"rewrite failed: {e}")

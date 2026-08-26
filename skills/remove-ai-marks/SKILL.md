@@ -212,6 +212,8 @@ Multi-pass recipe:
 
 **Code files:** Prefer formatter (`prettier`, `black`, `gofmt`, …) + Layer A. Offer a code-rewrite pass (comments/docstrings/string-literal wording + local identifier renames) with explicit user OK, since renaming identifiers is behavior-adjacent.
 
+**Minimum-divergence search:** when preserving as much of the original wording as possible matters more than speed — legal/medical/quoted material, or a user who explicitly wants the smallest possible edit — reach for `rewrite_text.py --minimal-select` (optionally with `--ladder minimal,humanize,paraphrase`) instead of the default single-pass rewrite. It generates and evaluates every `--candidates` variant per round and keeps the least lexically-diverged one that still clears detection, escalating strength only when a gentler level has zero passing candidates. This costs more rewrite attempts and detector calls than the default first-pass-wins loop, and it needs a real detector configured (`--markllm-scheme` or `--gumbel-key`/`WATERMARKS_GUMBEL_KEY`) — it fails fast without one, and without a detector there is nothing to search against. Same honesty caveat as the rest of Layer B: best-effort only, cannot certify removal against a vendor detector.
+
 #### Rewrite prompts (use as-is)
 
 **Paraphrase preserve meaning (word choice + syntax):**
