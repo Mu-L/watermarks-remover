@@ -14,8 +14,10 @@
 !/docs/**
 !/service/
 !/service/**
-!/skills/
-!/skills/**
+!/skills/remove-ai-marks/
+!/skills/remove-ai-marks/**
+!/skills/clean-user-facing-text/
+!/skills/clean-user-facing-text/**
 !/tests/
 !/tests/**
 !/.coderabbit.yaml

@@ -54,8 +54,11 @@ property of "AI-ness" the way perplexity is.
 - SynthID-Text (Google DeepMind, 2024): tournament sampling from the same
   red-green family, less perceptible.
 - Both key on the preceding token, so any meaning-preserving rewrite that
-  changes token order degrades detection: paraphrasing, edits, and
-  back-translation all work; a full architectural rewrite removes it entirely.
+  changes token order degrades detection against that specific detector:
+  paraphrasing, edits, and back-translation all work. Substantial rewriting
+  can reduce detection by a given detector, but watermark absence cannot be
+  verified without the applicable detector and key, so no rewrite removes a
+  watermark with certainty.
 
 Vendor status notes: Google retired SynthID text watermarking on the Generative
 Language API (mid-2026), so current API output is no longer watermarked.
@@ -75,6 +78,40 @@ guard: below 30 words it reports `insufficient_length` and no score; below 100
 words the score is dampened. Treat score movement as evidence about lexical and
 cadence signals, never as a verdict.
 
+Every report also carries a `density_tier` (`low` / `medium` / `high`, or
+`uncalibrated` when not scored). It is only a re-label of where the composite
+score sits: `high` means at or above the suspicious threshold, so the rewrite
+pass should engage. `low` / `medium` mean the measurable AI-density signals are
+weaker, so the skill should mostly verify rather than rewrite. It is not a
+proof of authorship either way.
+
+## Pattern categories folded in
+
+The scorer's phrase list (44 entries) and the prose levers below draw on two
+public humanizer catalogs, both derived from Wikipedia's "Signs of AI writing"
+field guide:
+
+- **blader/humanizer** — 35 numbered rewrite patterns grouped as: inflated
+  importance and legacy; name-dropping to prove importance; shallow `-ing`
+  analysis; sales language; vague sources; formulaic "challenges and outlook";
+  overused AI words; copula avoidance ("serves as", "boasts"); "not X but Y"
+  and clipped endings; forced groups of three; repeated openings; false
+  "from X to Y" ranges; passive voice; em/en dashes; bold/bold mini-heading
+  overuse; title-case headings; emojis; curly quotes; excessive hyphenated
+  pairs; fake-deeper-truth and fake-candid openings; announcing the next
+  point; forced punchlines; formulaic sayings; leftover chatbot text;
+  knowledge-limit disclaimers; overly agreeable tone; filler and hedging;
+  generic positive endings.
+- **conorbronsdon/avoid-ai-writing** — a 100+ word-replacement table in three
+  density tiers (always flag, flag in clusters, flag by density) plus a
+  detect-only audit mode and voice profiles. The tiering is the reason the
+  scorer flags common-but-normal words (`leverage`, `utilize`, `robust`,
+  `unprecedented`) only at low weight: its job is a gauge, not a proof.
+
+The regex-detectable subset is baked into `AI_PHRASE_PATTERNS`; the categories
+that resist regex (rule of three, repeated openings, forced punchlines,
+em-dash overuse) remain prose levers and are handled by the rewrite pass.
+
 ## Legitimate claims versus not
 
 Legitimate to report, honestly labeled:
@@ -82,6 +119,9 @@ Legitimate to report, honestly labeled:
 - Before and after scores from the vendored estimator, with its confidence
   level and findings ("the lexical and cadence signals moved").
 - What changed: phrase list cleared, burstiness CV moved, artifacts removed.
+- A detect-only audit (`inspect_text.py --audit`): a structured list of flagged
+  Unicode and stylometric spans with a per-span severity and a density tier.
+  This flags without rewriting and makes no authorship claim.
 - What the user must verify themselves: semantic equality, fact preservation,
   voice, required disclosures.
 
@@ -110,3 +150,7 @@ quality.
   retrieval-based defenses; the paper also establishes a theoretical
   impossibility result, which is why all of the above is the honest limit.
 - Kirchenbauer et al., watermarking (2023); Google DeepMind SynthID-Text (2024).
+- Pattern catalogs folded in (both MIT): blader/humanizer (35 Wikipedia-derived
+  rewrite patterns) and conorbronsdon/avoid-ai-writing (density-tiered
+  word-replacement table and detect-only audit mode). Both trace back to
+  Wikipedia's "Signs of AI writing" field guide.

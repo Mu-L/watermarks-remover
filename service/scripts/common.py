@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -163,13 +164,30 @@ def read_text_input(
         return _read_stdin_capped(allow_binary=allow_binary, advice=advice)
     p = Path(path)
     try:
-        size = p.stat().st_size
-    except OSError:
-        size = 0
-    if size > MAX_INPUT_BYTES:
+        st = p.stat()
+    except OSError as e:
+        eprint(f"cannot read {path}: {e}")
+        raise SystemExit(2) from None
+    # Reject non-regular files (FIFOs, devices, sockets): st_size is 0 for a
+    # FIFO, so opening one would block or stream until EOF with no cap.
+    if not stat.S_ISREG(st.st_mode):
+        eprint(f"refusing non-regular input (not a regular file): {path}")
+        raise SystemExit(2)
+    if st.st_size > MAX_INPUT_BYTES:
         eprint(f"refusing input larger than {MAX_INPUT_BYTES} bytes: {path}")
         raise SystemExit(2)
-    data = p.read_bytes()
+    try:
+        with p.open("rb") as f:
+            # Read at most MAX_INPUT_BYTES + 1: a file can grow after stat().
+            # The extra byte lets the size check below refuse rather than the
+            # read silently truncating an oversized file.
+            data = f.read(MAX_INPUT_BYTES + 1)
+    except OSError as e:
+        eprint(f"cannot read {path}: {e}")
+        raise SystemExit(2) from None
+    if len(data) > MAX_INPUT_BYTES:
+        eprint(f"refusing input larger than {MAX_INPUT_BYTES} bytes: {path}")
+        raise SystemExit(2)
     guard_binary(data, str(path), allow_binary=allow_binary, advice=advice)
     return data.decode("utf-8", errors="surrogateescape")
 
@@ -277,8 +295,8 @@ def safe_write_text(path: str | Path, text: str) -> None:
     safe_write_bytes(path, text.encode("utf-8", errors="surrogateescape"))
 
 
-def backup_path(src: Path) -> Path:
-    """Create a ``.bak`` copy of *src* via a safe write; return the backup path.
+def backup_path(src: Path) -> tuple[Path, bool]:
+    """Create a ``.bak`` copy of *src* via a safe write; return (backup, created).
 
     Used by ``--in-place`` flows so the original is never partially lost: the
     original file stays untouched until the cleaned output is atomically
@@ -441,10 +459,17 @@ def c2patool_probe_note(tools: dict[str, Any]) -> str | None:
     puts it in the `informational` bucket instead.
     """
     ct = tools.get("c2patool") or {}
-    if not ct.get("available") or ct.get("ok", True):
-        return None
-    detail = ct.get("error") or "no usable verdict"
-    return f"c2patool probe inconclusive ({detail}); C2PA not fully inspected by this tool"
+    # An explicitly recorded unavailable entry (available is False) means the
+    # probe was attempted but could not run; report it so callers do not read
+    # "not checked" as "clean". A tool with no entry at all is simply absent,
+    # which the `tools` dict already reflects and is not a finding.
+    if ct.get("available") is False:
+        detail = ct.get("error") or "not found"
+        return f"c2patool unavailable ({detail}); C2PA not fully inspected by this tool"
+    if not ct.get("ok", True):
+        detail = ct.get("error") or "no usable verdict"
+        return f"c2patool probe inconclusive ({detail}); C2PA not fully inspected by this tool"
+    return None
 
 
 def cleaned_path(src: Path, suffix: str = ".cleaned") -> Path:

@@ -44,12 +44,15 @@ AI_PHRASE_PATTERNS: tuple[tuple[str, str, float], ...] = (
     (r"\brich\s+tapestry(?:\s+of)?\b", "rich tapestry", 1.3),
     (r"\bplays?\s+a\s+(?:pivotal|crucial|vital|key)\s+role\b", "plays a pivotal/crucial role", 1.0),
     (
-        r"\bin\s+(?:today'?s|the)\s+(?:(?:fast-paced|ever-evolving|digital|rapidly\s+changing)\s+)*(?:world|landscape|era|environment)\b",
+        r"\bin\s+(?:today'?s|the)\s+"
+        r"(?:(?:fast-paced|ever-evolving|digital|rapidly\s+changing)\s+)*"
+        r"(?:world|landscape|era|environment)\b",
         "in today's fast-paced world/landscape",
         1.4,
     ),
     (
-        r"\bit\s+is\s+(?:important|essential|crucial|worth\s+noting)\s+to\s+(?:note|remember|consider|highlight)\b",
+        r"\bit\s+is\s+(?:important|essential|crucial|worth\s+noting)\s+to\s+"
+        r"(?:note|remember|consider|highlight)\b",
         "it is important/crucial to note",
         0.9,
     ),
@@ -95,6 +98,34 @@ AI_PHRASE_PATTERNS: tuple[tuple[str, str, float], ...] = (
     (r"\bmoreover\b[,\s]", "moreover,", 0.6),
     (r"\bas\s+an\s+ai\b", "as an AI", 1.5),
     (r"\bi\s+hope\s+this\s+helps\b", "I hope this helps", 1.2),
+    # Patterns folded in from blader/humanizer (Wikipedia "Signs of AI writing")
+    # and conorbronsdon/avoid-ai-writing's replacement table. These are the
+    # regex-detectable subset; the full prose category list lives in
+    # skill references/detectors.md. Weights stay moderate: this is a gauge,
+    # not a verdict, so a single hit should not dominate the composite.
+    (r"\bstands?\s+as\s+a\s+testament\b", "stands as a testament to", 1.1),
+    (r"\bmark(?:s|ing)?\s+an?\s+(?:indelible|pivotal|significant|new)\s+(?:moment|chapter|milestone)\b",
+     "marking a pivotal moment/chapter", 1.0),
+    (r"\b(?:reflecting|symbolizing|showcasing|underscoring)\s+(?:the|a|its)\b",
+     "shallow -ing analysis (reflecting/symbolizing/showcasing)", 0.9),
+    (r"\b(?:nestled|vibrant|breathtaking)\b", "sales language (nestled/vibrant)", 0.8),
+    (r"\b(?:game[- ]changer|game-changing)\b", "game-changer", 0.9),
+    (r"\b(?:unparalleled|unprecedented)\b", "unparalleled/unprecedented", 0.7),
+    (r"\b(?:world-class|state-of-the-art|cutting-edge)\b", "world-class/state-of-the-art", 0.8),
+    (r"\b(?:revolutionary|groundbreaking)\b", "revolutionary/groundbreaking", 0.6),
+    (r"\b(?:leverag(?:e|ing|ed|es)|utiliz(?:e|ing|ed|es))\b", "leverage/utilize", 0.8),
+    (r"\b(?:boasts?|feature(?:s|d)?)\b", "boasts/features (copula avoidance)", 0.6),
+    (r"\bit['\u2019]?s\s+not\s+just\b", "it's not just X, it's Y", 0.8),
+    (r"\b(?:not\s+just\b.{0,60}\bbut\s+also\b)", "not just X but also Y", 0.8),
+    (r"\bdive(?:s|d)?\s+into\b", "dive into", 0.7),
+    (r"\blet['\u2019]?s\s+(?:dive\s+in|get\s+started)\b", "let's dive in", 0.7),
+    (r"\bin\s+order\s+to\b", "in order to", 0.6),
+    (r"\bdue\s+to\s+the\s+fact\s+that\b", "due to the fact that", 0.8),
+    (r"\bit(?:['\u2019]s| is)\s+worth\s+noting\s+that\b", "it is worth noting that", 0.8),
+    (r"\b(?:needless\s+to\s+say|it\s+goes\s+without\s+saying)\b", "needless to say", 0.8),
+    (r"\bthe\s+future\s+looks\s+bright\b", "the future looks bright", 0.9),
+    (r"\b(?:sure\s+thing!?|great\s+question!?|happy\s+to\s+help)\b",
+     "assistant chatter (sure thing/great question)", 0.6),
 )
 
 RE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
@@ -126,8 +157,9 @@ class StylometryReport:
     lexical_diversity: float
     ai_ngram_density: float
     matched_markers: list[dict[str, Any]]
-    score: float
-    confidence_level: str  # CLEAN | LOW | MEDIUM | HIGH
+    score: float | None
+    confidence_level: str | None  # CLEAN | LOW | MEDIUM | HIGH, or None when uncalibrated
+    density_tier: str  # low | medium | high, or uncalibrated when not scored
     status: str  # ok | insufficient_length
     findings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -143,8 +175,9 @@ class StylometryReport:
             "lexical_diversity": round(self.lexical_diversity, 4),
             "ai_ngram_density": round(self.ai_ngram_density, 4),
             "matched_markers": self.matched_markers,
-            "score": round(self.score, 4),
+            "score": round(self.score, 4) if self.score is not None else None,
             "confidence_level": self.confidence_level,
+            "density_tier": self.density_tier,
             "status": self.status,
             "findings": self.findings,
             "findings_confidence": [classify_finding_confidence(f) for f in self.findings],
@@ -250,6 +283,23 @@ def scan_ai_phrases(text: str) -> list[MarkerMatch]:
     return matches
 
 
+def classify_density(score: float | None) -> str:
+    """Map a composite score to an edit-decision tier.
+
+    ``high`` means the text sits at or above the suspicious threshold, so the
+    skill's rewrite pass should engage; ``medium``/``low`` mean the measurable
+    AI-density signals are weaker and the skill should mainly verify rather than
+    rewrite. ``uncalibrated`` is returned for samples too short to score.
+    """
+    if score is None:
+        return "uncalibrated"
+    if score >= DEFAULT_THRESHOLD:
+        return "high"
+    if score >= 0.40:
+        return "medium"
+    return "low"
+
+
 def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
     """Run full multi-dimensional stylometric analysis and return a structured report."""
     words = extract_words(text)
@@ -266,7 +316,8 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
         for m in marker_matches:
             findings.append(f"AI phrase marker '{m.phrase}' found ({m.count}x)")
         notes.append(
-            f"Sample contains {word_count} words; statistical stylometry is uncalibrated below {MIN_SAMPLE_WORDS} words"
+            f"Sample contains {word_count} words; statistical stylometry is "
+            f"uncalibrated below {MIN_SAMPLE_WORDS} words, so no score is reported"
         )
         return StylometryReport(
             path=path,
@@ -276,8 +327,9 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
             lexical_diversity=compute_mattr(words),
             ai_ngram_density=0.0,
             matched_markers=[m.to_dict() for m in marker_matches],
-            score=0.0,
-            confidence_level="CLEAN",
+            score=None,
+            confidence_level=None,
+            density_tier="uncalibrated",
             status="insufficient_length",
             findings=findings,
             notes=notes,
@@ -293,7 +345,8 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
     ngram_density = (total_marker_weight / (word_count / 100.0)) if word_count > 0 else 0.0
 
     # 3. Component Sub-scores (0.0 to 1.0)
-    # Burstiness subscore: low CV (<0.35) is strongly characteristic of LLMs; high CV (>0.60) is human
+    # Burstiness subscore: low CV (<0.35) is strongly characteristic of LLMs;
+    # high CV (>0.60) is human
     burstiness_score: float | None
     if cv is None:
         # Fewer than two parseable sentences: burstiness is unmeasurable, not
@@ -329,7 +382,9 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
     # 4. Composite Scoring & Small-Sample Dampening
     if burstiness_score is None:
         notes.append(
-            "Sentence burstiness unavailable (fewer than 2 parsed sentences — e.g. body wrapped in a code fence); composite renormalized over AI-phrase density and lexical diversity"
+            "Sentence burstiness unavailable (fewer than 2 parsed sentences — "
+            "e.g. body wrapped in a code fence); composite renormalized over "
+            "AI-phrase density and lexical diversity"
         )
         raw_composite = ((ngram_score * 0.45) + (diversity_score * 0.10)) / 0.55
     else:
@@ -341,7 +396,8 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
             (word_count - MIN_SAMPLE_WORDS) / (FULL_WEIGHT_WORDS - MIN_SAMPLE_WORDS)
         )
         notes.append(
-            f"Sample word count ({word_count}) is in calibration range ({MIN_SAMPLE_WORDS}-{FULL_WEIGHT_WORDS}); score dampened by factor {dampener:.2f}"
+            f"Sample word count ({word_count}) is in calibration range "
+            f"({MIN_SAMPLE_WORDS}-{FULL_WEIGHT_WORDS}); score dampened by factor {dampener:.2f}"
         )
     else:
         dampener = 1.0
@@ -378,6 +434,7 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
         matched_markers=[m.to_dict() for m in marker_matches],
         score=final_score,
         confidence_level=confidence,
+        density_tier=classify_density(final_score),
         status="ok",
         findings=findings,
         notes=notes,
@@ -387,9 +444,17 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
 def print_human_stylometry_report(report: StylometryReport, explain: bool = False) -> None:
     """Print clean human-readable output to stdout."""
     print(f"=== Stylometric AI-Text Report: {report.path} ===")
+    print("Gauge only: measures lexical and cadence signals, not authorship.")
     print(f"Status:             {report.status}")
-    print(f"Confidence Level:   {report.confidence_level}")
-    print(f"AI Probability:     {report.score * 100:.1f}% (score: {report.score:.3f})")
+    if report.confidence_level is not None:
+        print(f"Confidence Level:   {report.confidence_level}")
+    else:
+        print("Confidence Level:   n/a")
+    if report.score is not None:
+        print(f"Stylometry Score:   {report.score * 100:.1f}% (score: {report.score:.3f})")
+    else:
+        print("Stylometry Score:   n/a (sample too short to score)")
+    print(f"Density Tier:       {report.density_tier}")
     print(f"Word Count:         {report.word_count}")
     print(f"Sentence Count:     {report.sentence_count}")
     cv_display = (
@@ -451,7 +516,7 @@ def main() -> int:
     else:
         print_human_stylometry_report(report, explain=args.explain)
 
-    if report.score >= args.threshold:
+    if report.status == "ok" and report.score is not None and report.score >= args.threshold:
         return 1
     return 0
 

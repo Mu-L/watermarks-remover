@@ -72,7 +72,7 @@ def scan_file(
         if check_stylometry and text:
             s_rep = score_text_stylometry(text, path=name)
             item["stylometry"] = s_rep.to_dict()
-            if s_rep.score >= 0.65:
+            if s_rep.status == "ok" and (s_rep.score or 0.0) >= 0.65:
                 item["findings"].append(
                     f"stylometry [high_probability] score {s_rep.score:.2f} ({s_rep.confidence_level})"
                 )
@@ -134,7 +134,7 @@ def scan_file(
         if text:
             s_rep = score_text_stylometry(text, path=name)
             stylometry_dict = s_rep.to_dict()
-            if s_rep.score >= 0.65:
+            if s_rep.status == "ok" and (s_rep.score or 0.0) >= 0.65:
                 findings.append(
                     f"stylometry [high_probability] score {s_rep.score:.2f} ({s_rep.confidence_level})"
                 )

@@ -14,17 +14,27 @@ Apply a final text-hygiene pass to prose the user owns or is authorized to proce
    - fenced and inline code
    - commands, paths, URLs, identifiers, API names, and exact values
    - formulas, citations, and text the user asks to quote verbatim
-3. Preserve every claim, fact, number, name, citation, and requirement.
-4. **Measure before.** Score the input with the vendored zero-LLM stylometry estimator (see Scoring) and record the score:
+3. Preserve every claim, fact, number, name, citation, and requirement. Never invent a detail, name, number, quote, or source to make the prose easier to write or more varied: if a fact is missing, flag the gap rather than fill it. The rewrite may sharpen, compress, or reorder, but it may not add or remove claims.
+4. **Measure before.** Inspect and score the input with the vendored zero-LLM stylometry estimator (see Scoring) and record the score. Read the report's `density_tier`: rewrite only when it is `high`; for `low` or `medium`, verify the text and otherwise leave it human-written. For a flag-only audit that never rewrites, use `--audit`:
+
    ```bash
    PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json INPUT
+   PYTHON "$SCRIPTS/inspect_text.py" --audit INPUT  # detect-only: lists flagged spans, no rewrite
    ```
+
 5. Establish the writing brief before changing prose:
    - use a voice sample only when the user owns it or is authorised to use it; don't imitate another named person
    - when there is no sample, make the prose clear and natural without pretending to imitate a particular person
+   - never inject a voice the source lacks: no fake first person ("I've seen this"), invented specifics, forced contrarianism, performed candor, or added stance and personality. Preserve the writer's deliberate rough edges and domain terms rather than scrubbing them
    - keep required disclosures, uncertainty, and the writer's actual point of view
    - pick the voice and domain preset the text fits (see Voice and domain presets); the default is general prose
-6. Rewrite the remaining prose once, applying the detector levers (see Detector levers) in order:
+6. **Layer A — strip artifacts first.** For text artifacts or supplied text files, run the deterministic Unicode pass before rewriting, so the rewrite operates on clean, marker-free text:
+
+   ```bash
+   PYTHON "$SCRIPTS/clean_text.py" INPUT -o OUTPUT --stats --no-normalize-spaces
+   ```
+
+7. **Layer B — rewrite once.** Rewrite the remaining prose once, applying the detector levers (see Detector levers) in order:
    - vary clause order, sentence boundaries, rhythm, connectors, and function words
    - replace formulaic transitions and filler with direct, natural wording
    - keep the concrete details and judgement that make the text recognisable as the writer's
@@ -32,9 +42,14 @@ Apply a final text-hygiene pass to prose the user owns or is authorized to proce
    - preserve the requested language, tone, structure, and formatting; never translate unless asked
    - for non-English text, use fluent constructions native to that language rather than English sentence patterns
    - do not add or remove claims merely to increase variation
-7. For text artifacts or supplied text files, run the deterministic Unicode pass after rewriting.
-8. **Measure after.** Score the rewritten text the same way and report both scores with their confidence levels. A lower after-score means the measurable signals moved; it is not a verdict from any detector, and it never overrides the fact and voice rules above.
-9. Return only the polished result unless the user asks for an audit or explanation.
+8. **Layer A again.** Run the deterministic Unicode pass on the rewritten result to catch any artifacts the rewrite introduced (smart quotes, em dashes, homoglyphs):
+
+   ```bash
+   PYTHON "$SCRIPTS/clean_text.py" OUTPUT -o FINAL --stats --no-normalize-spaces
+   ```
+
+9. **Measure after.** Score the rewritten text the same way and report both scores with their confidence levels. A lower after-score means the measurable signals moved; it is not a verdict from any detector, and it never overrides the fact and voice rules above.
+10. Return only the polished result unless the user asks for an audit or explanation.
 
 For practical guidance on preserving a writer's voice and removing formulaic prose,
 read `references/writing-in-your-voice.md` whenever the user asks to retain or adjust voice.
@@ -47,8 +62,12 @@ which also accepts `--explain`) runs the zero-LLM estimator vendored from the se
 pipeline: sentence-length burstiness (coefficient of variation), weighted AI-cadence
 phrase density per 100 words, lexical diversity (MATTR), and a dampened composite
 score from 0 to 1. Exit code 1 means the score is at or above the threshold
-(default 0.65). Under 30 words the estimator reports `status: insufficient_length`
-instead of a score. Nothing here calls the network; the skill stays self-contained.
+(default 0.65). The report also carries a `density_tier` (`low` / `medium` /
+`high`, or `uncalibrated` when not scored) that re-labels where the score sits
+so the rewrite pass engages only for `high`. `inspect_text.py --audit` produces
+the same scoring plus the detect-only flagged-span list but never rewrites.
+Under 30 words the estimator reports `status: insufficient_length` instead of a
+score. Nothing here calls the network; the skill stays self-contained.
 
 Limits: the estimator is calibrated for the statistical detector family
 (perplexity and burstiness style signals). It is not the output of trained neural
@@ -64,6 +83,10 @@ Resolve `SCRIPTS` to this skill's `scripts/` directory.
 Use the available Python 3 launcher for the platform. Replace `PYTHON` below
 with `python3` on most macOS/Linux systems, `py` on Windows, or another verified
 Python 3 command.
+
+This skill is self-contained and runs its vendored scripts directly; it has no
+service or network dependency. Deterministic Layer A cleaning below is invoked
+by script, intentionally, so the skill works where the HTTP service is absent.
 
 Inspect first when editing an existing file (include `--stylometry` to record
 the before score):
@@ -89,7 +112,11 @@ For a chat-only response that is not written to a file, perform the rewrite work
 Statistical detectors score probability patterns: AI prose is too predictable (low
 perplexity), too even (low burstiness), and too full of stock phrases. The levers
 below target those signals, most effective first. Levers 1, 2, and 6 are
-deterministic or near-deterministic; 3 to 5 are aims, not guarantees.
+deterministic or near-deterministic; 3 to 5 are aims, not guarantees. Engage the
+rewrite levers only when the measure-before `density_tier` is `high`; for `low`
+or `medium`, the measurable AI-density signals are weak, so verify and otherwise
+leave human-written text alone. The pass ordering below follows the pattern
+catalogs in `references/detectors.md`.
 
 1. **Strip artifacts first (always).** Run the deterministic Unicode pass
    (`clean_text.py`) before anything else: invisible characters and homoglyphs are
@@ -138,6 +165,16 @@ not guarantees of any detector result.
 | Academic / professional | Formal, evidence-first | Restrained variation, controlled hedging | Over-claiming verbs, novelty padding, citation dumps; keep required discipline |
 | Business / product copy | Plain claims, concrete value | Direct sentences | "Seamless", "empower", vague benefits, rule of three, required disclaimers kept |
 | Fiction | Invented detail allowed | Variation to fit the narrator | Uniform cadence, editorial clichés; preserve dialect and quirks |
+
+### Plain-language sub-mode
+
+For procedures, runbooks, errors, and other engineer-facing text, the user may
+request a plain-language sub-mode: short common words, one instruction per
+sentence, imperative verbs for steps, one meaning per term, and no marketing
+adjectives or unbounded hedging. This sub-mode is a clarity floor, not a new
+personality: it strips voice deliberately, keeps every claim and requirement,
+and is not a detector-evasion tool. Use the voice-preserving presets above for
+essays, posts, and personal prose instead.
 
 ## Code boundary
 
