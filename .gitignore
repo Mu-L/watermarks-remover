@@ -14,8 +14,8 @@
 !/docs/**
 !/service/
 !/service/**
-!/skills/remove-ai-marks/
-!/skills/remove-ai-marks/**
+!/skills/
+!/skills/**
 !/tests/
 !/tests/**
 !/.coderabbit.yaml
