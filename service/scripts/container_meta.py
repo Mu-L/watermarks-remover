@@ -160,6 +160,58 @@ AI_META_NAME_RE = re.compile(
     re.I,
 )
 
+# Names whose value names the producing tool -- a Markdown frontmatter key
+# or an HTML <meta name="...">. These are the document analogue of PNG's
+# Software/Creator/parameters chunks (see image_meta._GENERATOR_TEXT_KEYS):
+# only under these names does a value like "Claude" or "generator" mean
+# provenance rather than subject matter.
+GENERATOR_NAME_KEYS = frozenset(
+    {
+        "generator",
+        "generated_by",
+        "generatedby",
+        "created_with",
+        "createdwith",
+        "made_with",
+        "madewith",
+        "creator",
+        "producer",
+        "software",
+        "tool",
+        "engine",
+    }
+)
+
+# Values carried by every other name are free prose -- descriptions,
+# summaries, abstracts, notes an author writes about their own subject --
+# so they are matched only against markers that are never ordinary English.
+# This is the same rule image_meta applies to unkeyed JPEG COM text: bare
+# vendor names and the word "generator" are ordinary prose ("Claude Monet",
+# "a static site generator"), and only a naming field makes them evidence.
+#
+# Anchored on word boundaries so "aigc" cannot match inside another word.
+AI_FREE_TEXT_MARKER_RE = re.compile(
+    r"\bc2pa\b|\bcontent[-_ ]?credentials?\b|\bcontentauth\b|\bcai:|"
+    r"\bsynthid\b|\baigc\b|\bdigital[-_ ]?source[-_ ]?type\b|"
+    r"\b(?:trained[-_ ]?)?algorithmic[-_ ]?media\b",
+    re.I,
+)
+
+
+def named_value_is_ai(name: str, value: str) -> bool:
+    """True when a named *value* is evidence of a provenance mark.
+
+    `name` is a Markdown frontmatter key or an HTML meta name; `value` is what
+    it carries. Shared by the inspect and clean paths of both formats on
+    purpose: a checker and the cleaner it gates must not be able to disagree
+    about what counts. If they drift, clean deletes a field that inspect calls
+    clean, and the loss is silent because the document still parses.
+    """
+    if name.lower() in GENERATOR_NAME_KEYS:
+        return bool(AI_META_NAME_RE.search(value))
+    return bool(AI_FREE_TEXT_MARKER_RE.search(value))
+
+
 SVG_DROP_TAGS = frozenset(
     {
         "{http://www.w3.org/2000/svg}metadata",
@@ -582,7 +634,7 @@ def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
                 findings.append(f"frontmatter key: {key}")
             # also check value
             val = _line.split(":", 1)[1] if ":" in _line else ""
-            if AI_META_NAME_RE.search(val):
+            if named_value_is_ai(key, val):
                 has_ai = True
                 findings.append(f"frontmatter value hit on {key}")
 
@@ -632,7 +684,7 @@ def clean_markdown(text: str) -> tuple[str, list[str]]:
                 actions.append(f"drop frontmatter key: {key}")
                 dropping = True
                 continue
-            if AI_META_NAME_RE.search(val):
+            if named_value_is_ai(key, val):
                 actions.append(f"drop frontmatter key (value hit): {key}")
                 dropping = True
                 continue
@@ -1215,6 +1267,35 @@ def _is_cms_generator_meta(tag: str) -> bool:
     return not (_GENERATOR_AI_RE.search(attrs.get("content", "")) or _GENERATOR_AI_RE.search(tag))
 
 
+_META_CONTENT_VALUE_RE = re.compile(
+    r"""(\bcontent\s*=\s*)(["'])[^"']*\2""",
+    re.I,
+)
+
+
+def _meta_tag_is_ai(tag: str) -> bool:
+    """True when an HTML <meta> tag is evidence of a provenance mark.
+
+    Only the `content` value is judged by the free-prose rule; the rest of the
+    tag keeps the original whole-tag scan, so anything that used to be caught
+    in an attribute other than `content` still is. Without this split a page
+    loses its description to a sentence about "a static site generator".
+    """
+    attrs = _meta_attrs(tag)
+    name = attrs.get("name") or attrs.get("property") or attrs.get("generator") or ""
+    content = attrs.get("content", "")
+    # Blank the `content` attribute specifically. A plain str.replace of the
+    # value would also erase an identical string sitting in another attribute
+    # -- <meta property="Claude" content="Claude"> would lose both copies and
+    # read clean -- which is the opposite of the guarantee this split makes.
+    skeleton = _META_CONTENT_VALUE_RE.sub(r"\g<1>\g<2>\g<2>", tag)
+    if AI_META_NAME_RE.search(skeleton) or any(
+        h.decode("ascii", "ignore").lower() in skeleton.lower() for h in AI_META_HINTS[:12]
+    ):
+        return True
+    return named_value_is_ai(name, content)
+
+
 _JSONLD_CLOSE_RE = re.compile(r"</script>", re.I)
 # HTML treats form feed as whitespace; include it wherever attribute separators
 # are checked.
@@ -1339,9 +1420,7 @@ def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
         if _is_cms_generator_meta(tag):
             findings.append(f"info: cms generator: {tag[:120]}")
             continue
-        if AI_META_NAME_RE.search(tag) or any(
-            h.decode("ascii", "ignore").lower() in tag.lower() for h in AI_META_HINTS[:12]
-        ):
+        if _meta_tag_is_ai(tag):
             has_ai = True
             findings.append(f"meta: {tag[:120]}")
     for os_, oe, _cs, ce in _iter_script_blocks(text):
@@ -1377,9 +1456,7 @@ def clean_html(text: str) -> tuple[str, list[str]]:
         tag = m.group(0)
         if _is_cms_generator_meta(tag):
             return tag
-        if AI_META_NAME_RE.search(tag) or re.search(
-            r"generator|claude|anthropic|openai|gemini|synthid|c2pa|aigc", tag, re.I
-        ):
+        if _meta_tag_is_ai(tag):
             actions.append(f"drop meta: {tag[:80]}")
             return ""
         return tag

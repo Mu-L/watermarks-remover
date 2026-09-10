@@ -57,6 +57,13 @@ Industry framing (C2PA + SynthID two-layer model; see Institute of AI PM guide i
 | HTML | Meta generator / JSON-LD / data-ai* |
 | Markdown | YAML frontmatter AI keys |
 
+A metadata *value* (frontmatter value, `<meta content="...">`) is only matched
+against the full vendor vocabulary when its name is a naming field
+(`generator`, `created_with`, `tool`, ...). Under any other name the value is
+free prose and only unambiguous markers (C2PA, SynthID, AIGC,
+digitalSourceType) count — "a static site generator" and "Claude Monet" are
+ordinary writing, not provenance.
+
 **Removal:** `clean_file.py` / `clean_image.py` — usually verifiable by re-inspect.
 
 **Honest report:** after a successful C2PA strip, soft-bound / pixel SynthID (if the generator used them) may still be detectable by vendor tools (e.g. SynthID Detector, Content Credentials verify sites).
